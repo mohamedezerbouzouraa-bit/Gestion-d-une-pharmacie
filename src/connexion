@@ -1,0 +1,711 @@
+package connection;
+
+import java.sql.*;
+import java.util.ArrayList;
+import java.io.*;
+import java.util.Properties;
+
+public class sqlcon {
+	private static String currentPassword = loadPassword(); 
+    private static final String URL_SERVER = "jdbc:mysql://localhost:3306/";
+    private static final String DB_NAME = "pharmacie_db";
+    private static final String CONFIG_FILE = "config.properties";
+
+    // --- GESTION DU MOT DE PASSE ---
+    private static String loadPassword() {
+        Properties prop = new Properties();
+        try (InputStream input = new FileInputStream(CONFIG_FILE)) {
+            prop.load(input);
+            return prop.getProperty("db.password", "");
+        } catch (IOException ex) {
+            return ""; 
+        }
+    }
+
+    private static void savePassword(String password) {
+        Properties prop = new Properties();
+        try (OutputStream output = new FileOutputStream(CONFIG_FILE)) {
+            prop.setProperty("db.password", password);
+            prop.store(output, null);
+        } catch (IOException io) {
+            io.printStackTrace();
+        }
+    }
+
+    public static Connection getCon() {
+        try {
+            return DriverManager.getConnection(URL_SERVER + DB_NAME + "?useSSL=false", "root", currentPassword);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    // --- CONFIGURATION INITIALE ---
+  public static boolean setupDatabase(String password) {
+        try {
+            Class.forName("com.mysql.cj.jdbc.Driver");
+            // Connexion au serveur
+            try (Connection con = DriverManager.getConnection(URL_SERVER + "?useSSL=false", "root", password)) {
+                
+                Statement st = con.createStatement();
+                
+                // On utilise IF NOT EXISTS ici aussi pour ne pas faire planter Java
+                st.executeUpdate("CREATE DATABASE IF NOT EXISTS " + DB_NAME);
+                st.executeUpdate("USE " + DB_NAME);
+                
+                File scriptFile = new File("pharmacie.sql");
+                if (!scriptFile.exists()) return false;
+
+                try (BufferedReader br = new BufferedReader(new FileReader(scriptFile))) {
+                    StringBuilder sqlStatement = new StringBuilder();
+                    String line;
+                    while ((line = br.readLine()) != null) {
+                        String trimmedLine = line.trim();
+                        if (trimmedLine.isEmpty() || trimmedLine.startsWith("--") || trimmedLine.startsWith("/*")) {
+                            continue;
+                        }
+                        sqlStatement.append(line).append(" ");
+                        if (trimmedLine.endsWith(";")) {
+                            // On tente l'exécution. Si la table existe, le IF NOT EXISTS du SQL 
+                            // empêchera l'erreur de remonter jusqu'à Java.
+                            try {
+                                st.execute(sqlStatement.toString());
+                            } catch (SQLException e) {
+                                // On ignore l'erreur si c'est juste une table déjà existante
+                                System.out.println("Info: " + e.getMessage());
+                            }
+                            sqlStatement.setLength(0);
+                        }
+                    }
+                }
+                
+                currentPassword = password; 
+                savePassword(password);
+                return true;
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+            return false;
+        }
+    }
+
+    // --- GESTION DES UTILISATEURS ---
+    public static String checkLogin(String user, String pass) {
+        String query = "SELECT type FROM utilisateur WHERE user = ? AND password = ?";
+        try (Connection con = getCon();
+             PreparedStatement pst = con.prepareStatement(query)) {
+            if (con == null) return null;
+            pst.setString(1, user);
+            pst.setString(2, pass);
+            ResultSet rs = pst.executeQuery();
+            if (rs.next()) return rs.getString("type"); 
+        } catch (SQLException e) { e.printStackTrace(); }
+        return null;
+    }
+
+    public static ArrayList<String[]> getListeUtilisateurs() {
+        ArrayList<String[]> liste = new ArrayList<>();
+        String query = "SELECT user, type, cle FROM utilisateur";
+        try (Connection con = getCon();
+             PreparedStatement pst = con.prepareStatement(query);
+             ResultSet rs = pst.executeQuery()) {
+            while (rs.next()) {
+                liste.add(new String[]{ rs.getString("user"), rs.getString("type"), rs.getString("cle") });
+            }
+        } catch (SQLException e) { e.printStackTrace(); }
+        return liste;
+    }
+
+    public static void ajouterUtilisateur(String user, String pass, String type) {
+        String query = "INSERT INTO utilisateur (user, password, type) VALUES (?, ?, ?)";
+        try (Connection con = getCon(); PreparedStatement pst = con.prepareStatement(query)) {
+            pst.setString(1, user);
+            pst.setString(2, pass);
+            pst.setString(3, type);
+            pst.executeUpdate();
+        } catch (Exception e) { e.printStackTrace(); }
+    }
+
+    public static void modifierUtilisateur(String id, String user, String pass, String type) {
+        String query = "UPDATE utilisateur SET user=?, password=?, type=? WHERE cle=?";
+        try (Connection con = getCon(); PreparedStatement pst = con.prepareStatement(query)) {
+            pst.setString(1, user);
+            pst.setString(2, pass);
+            pst.setString(3, type);
+            pst.setString(4, id);
+            pst.executeUpdate();
+        } catch (Exception e) { e.printStackTrace(); }
+    }
+
+    public static void supprimerUtilisateur(String id) {
+        String query = "DELETE FROM utilisateur WHERE cle=?";
+        try (Connection con = getCon(); PreparedStatement pst = con.prepareStatement(query)) {
+            pst.setString(1, id);
+            pst.executeUpdate();
+        } catch (Exception e) { e.printStackTrace(); }
+    }
+
+    // --- STATISTIQUES (COMPATIBLES 3FN) ---
+
+    public static String getPourcentageStock() {
+        double pourcentage = 0;
+        try (Connection con = getCon(); Statement st = con.createStatement()) {
+            if (con == null) return "0%";
+
+            ResultSet rsTotal = st.executeQuery("SELECT COUNT(*) FROM stock");
+            int total = rsTotal.next() ? rsTotal.getInt(1) : 0;
+            
+            // Correction du nom de colonne : quantite_stock
+            ResultSet rsSain = st.executeQuery("SELECT COUNT(*) FROM stock WHERE quantite_stock > 50");
+            int sain = rsSain.next() ? rsSain.getInt(1) : 0;
+            
+            if (total > 0) pourcentage = ((double) sain / total) * 100;
+        } catch (Exception e) {
+            System.err.println("Erreur pourcentage stock : " + e.getMessage());
+            return "0%"; 
+        }
+        return String.format("%.0f%%", pourcentage);
+    }
+
+    public static String getChiffreAffaire() {
+        double totalCA = 0;
+        // Jointure obligatoire car le prix est uniquement dans la table stock (3FN)
+        String query = "SELECT COALESCE(SUM(c.quantite_commande * s.prix_unitaire), 0) " +
+                       "FROM commande_client c " +
+                       "JOIN stock s ON c.nom_stock = s.nom";
+        try (Connection con = getCon(); 
+             Statement st = con.createStatement();
+             ResultSet rs = st.executeQuery(query)) {
+            if (rs.next()) totalCA = rs.getDouble(1);
+        } catch (Exception e) {
+            System.err.println("Erreur calcul CA : " + e.getMessage());
+            return "0 DT";
+        }
+        return String.format("%.0f DT", totalCA);
+    }
+
+    public static String getValeurTotalStock() {
+        double totalAchat = 0;
+        // On calcule la somme de ce qu'on a payé aux fournisseurs (fprix_achat_total)
+        String query = "SELECT COALESCE(SUM(fprix_achat_total), 0) FROM commande_fournisseur";
+        
+        try (Connection con = getCon(); 
+             Statement st = con.createStatement();
+             ResultSet rs = st.executeQuery(query)) {
+            
+            if (rs.next()) {
+                totalAchat = rs.getDouble(1);
+            }
+        } catch (Exception e) {
+            System.err.println("Erreur calcul achat fournisseur : " + e.getMessage());
+            return "0 DT";
+        }
+        // Retourne le montant payé aux fournisseurs (ex: 1240 DT)
+        return String.format("%.0f DT", totalAchat);
+    }
+    public static String getNombreFournisseurs() {
+        int total = 0;
+        String query = "SELECT COUNT(*) FROM fournisseur";
+        try (Connection con = getCon(); 
+             Statement st = con.createStatement();
+             ResultSet rs = st.executeQuery(query)) {
+            
+            if (rs.next()) {
+                total = rs.getInt(1);
+            }
+        } catch (Exception e) {
+            return "0 ACTIF";
+        }
+        return total + (total > 1 ? " ACTIFS" : " ACTIF");
+    }
+    public static java.util.ArrayList<Object[]> getVentesDetailsJour() {
+        java.util.ArrayList<Object[]> liste = new java.util.ArrayList<>();
+        // Requête qui lie commande_client, client et stock
+        String sql = "SELECT c.id_commande_client, cl.nom, (c.quantite_commande * s.prix_unitaire) as total, " +
+                     "DATE_FORMAT(c.date_commande, '%H:%i') as heure " +
+                     "FROM commande_client c " +
+                     "JOIN client cl ON c.id_client = cl.id_client " +
+                     "JOIN stock s ON c.nom_stock = s.nom " +
+                     "WHERE DATE(c.date_commande) = CURDATE() " +
+                     "ORDER BY c.date_commande DESC";
+
+        try (java.sql.Connection con = getCon();
+             java.sql.PreparedStatement pst = con.prepareStatement(sql);
+             java.sql.ResultSet rs = pst.executeQuery()) {
+
+            while (rs.next()) {
+                liste.add(new Object[]{
+                    "CMD-" + rs.getInt("id_commande_client"), // ID formaté
+                    rs.getString("nom"),                      // Nom du client
+                    String.format("%.3f", rs.getFloat("total")) + " DT", // Montant calculé
+                    rs.getString("heure")                     // Heure de la vente
+                });
+            }
+        } catch (Exception e) {
+            System.out.println("Erreur SQL Ventes: " + e.getMessage());
+        }
+        return liste;
+    }
+    public static java.util.ArrayList<String> getAllDatesVentes() {
+        java.util.ArrayList<String> dates = new java.util.ArrayList<>();
+        String sql = "SELECT DISTINCT DATE(date_commande) as jour FROM commande_client ORDER BY jour DESC";
+        try (java.sql.Connection con = getCon();
+             java.sql.PreparedStatement pst = con.prepareStatement(sql);
+             java.sql.ResultSet rs = pst.executeQuery()) {
+            while (rs.next()) {
+                dates.add(rs.getString("jour"));
+            }
+        } catch (Exception e) { e.printStackTrace(); }
+        return dates;
+    }
+    public static java.util.ArrayList<Object[]> getVentesParDate(String dateChoisie) {
+        java.util.ArrayList<Object[]> liste = new java.util.ArrayList<>();
+        String sql = "SELECT cl.nom, (c.quantite_commande * s.prix_unitaire) as total, " +
+                     "DATE_FORMAT(c.date_commande, '%H:%i') as heure " +
+                     "FROM commande_client c " +
+                     "JOIN client cl ON c.id_client = cl.id_client " +
+                     "JOIN stock s ON c.nom_stock = s.nom " +
+                     "WHERE DATE(c.date_commande) = ? " +
+                     "ORDER BY c.date_commande DESC";
+
+        try (java.sql.Connection con = getCon();
+             java.sql.PreparedStatement pst = con.prepareStatement(sql)) {
+            pst.setString(1, dateChoisie);
+            java.sql.ResultSet rs = pst.executeQuery();
+            while (rs.next()) {
+                liste.add(new Object[]{ "", rs.getString("nom"), String.format("%.3f", rs.getFloat("total")), rs.getString("heure") });
+            }
+        } catch (Exception e) { e.printStackTrace(); }
+        return liste;
+    }
+    public static java.util.ArrayList<Object[]> getAllVentesHistorique() {
+        java.util.ArrayList<Object[]> liste = new java.util.ArrayList<>();
+        // On récupère la date au format 'YYYY-MM-DD' pour pouvoir grouper
+        String sql = "SELECT DATE(c.date_commande) as jour, cl.nom, " +
+                     "(c.quantite_commande * s.prix_unitaire) as total, " +
+                     "DATE_FORMAT(c.date_commande, '%H:%i') as heure " +
+                     "FROM commande_client c " +
+                     "JOIN client cl ON c.id_client = cl.id_client " +
+                     "JOIN stock s ON c.nom_stock = s.nom " +
+                     "ORDER BY c.date_commande DESC";
+
+        try (java.sql.Connection con = getCon();
+             java.sql.PreparedStatement pst = con.prepareStatement(sql);
+             java.sql.ResultSet rs = pst.executeQuery()) {
+            while (rs.next()) {
+                liste.add(new Object[]{
+                    rs.getString("jour"), 
+                    rs.getString("nom"), 
+                    String.format("%.3f", rs.getFloat("total")), 
+                    rs.getString("heure")
+                });
+            }
+        } catch (Exception e) { e.printStackTrace(); }
+        return liste;
+    }
+    public static int getCountAlertes(int seuil) {
+        int total = 0;
+        // On utilise le paramètre 'seuil' au lieu du chiffre fixe 10
+        String query = "SELECT COUNT(*) FROM stock WHERE quantite_stock < ?";
+        try (Connection con = getCon(); 
+             PreparedStatement ps = con.prepareStatement(query)) {
+            ps.setInt(1, seuil);
+            ResultSet rs = ps.executeQuery();
+            if (rs.next()) total = rs.getInt(1);
+        } catch (Exception e) { e.printStackTrace(); }
+        return total;
+    }
+
+    public static ArrayList<String[]> getAlertesStockDetail(int seuil) {
+        ArrayList<String[]> liste = new ArrayList<>();
+        String query = "SELECT nom, quantite_stock FROM stock WHERE quantite_stock < ?";
+        try (Connection con = getCon(); 
+             PreparedStatement ps = con.prepareStatement(query)) {
+            ps.setInt(1, seuil);
+            ResultSet rs = ps.executeQuery();
+            while (rs.next()) {
+                liste.add(new String[]{rs.getString(1), rs.getString(2)});
+            }
+        } catch (Exception e) { e.printStackTrace(); }
+        return liste;
+    }
+    public static int getCommandesCount() {
+        int total = 0;
+        try (Connection con = getCon(); 
+             Statement st = con.createStatement(); 
+             ResultSet rs = st.executeQuery("SELECT COUNT(*) FROM commande_fournisseur")) {
+            if (rs.next()) total = rs.getInt(1);
+        } catch (SQLException e) { e.printStackTrace(); }
+        return total;
+    }
+    public static String getVentesJour() {
+        double total = 0;
+        // Calcule la somme (quantité * prix) pour les commandes de la date actuelle
+        String query = "SELECT SUM(cc.quantite_commande * s.prix_unitaire) " +
+                       "FROM commande_client cc " +
+                       "JOIN stock s ON cc.nom_stock = s.nom " +
+                       "WHERE DATE(cc.date_commande) = CURDATE()";
+        try (Connection con = getCon(); 
+             Statement st = con.createStatement(); 
+             ResultSet rs = st.executeQuery(query)) {
+            if (rs.next()) {
+                total = rs.getDouble(1);
+            }
+        } catch (SQLException e) { e.printStackTrace(); }
+        
+        // Retourne le total formaté avec "DT"
+        return String.format("%.3f", total) + " DT";
+    }
+ // 1. Récupérer tous les produits du stock
+    public static java.util.ArrayList<Object[]> getInventaire() {
+        java.util.ArrayList<Object[]> liste = new java.util.ArrayList<>();
+        String sql = "SELECT nom, quantite_stock, prix_unitaire FROM stock";
+        try (java.sql.Connection con = getCon();
+             java.sql.PreparedStatement pst = con.prepareStatement(sql);
+             java.sql.ResultSet rs = pst.executeQuery()) {
+            while (rs.next()) {
+                liste.add(new Object[]{
+                    rs.getString("nom"),
+                    rs.getInt("quantite_stock"),
+                    String.format("%.3f", rs.getFloat("prix_unitaire")) + " DT"
+                });
+            }
+        } catch (Exception e) { e.printStackTrace(); }
+        return liste;
+    }
+
+    // 2. Ajouter un produit
+    public static boolean ajouterProduit(String nom, int qte, float prix) {
+        String sql = "INSERT INTO stock (nom, quantite_stock, prix_unitaire) VALUES (?, ?, ?) " +
+                     "ON DUPLICATE KEY UPDATE quantite_stock = quantite_stock + ?, prix_unitaire = ?";
+        try (java.sql.Connection con = getCon();
+             java.sql.PreparedStatement pst = con.prepareStatement(sql)) {
+            pst.setString(1, nom);
+            pst.setInt(2, qte);
+            pst.setFloat(3, prix);
+            pst.setInt(4, qte);
+            pst.setFloat(5, prix);
+            return pst.executeUpdate() > 0;
+        } catch (Exception e) { return false; }
+    }
+
+    // 3. Supprimer un produit
+    public static boolean supprimerProduit(String nom) {
+        String sql = "DELETE FROM stock WHERE nom = ?";
+        try (java.sql.Connection con = getCon();
+             java.sql.PreparedStatement pst = con.prepareStatement(sql)) {
+            pst.setString(1, nom);
+            return pst.executeUpdate() > 0;
+        } catch (Exception e) { return false; }
+    }
+    public static boolean updateProduitTotal(String ancienNom, String nouveauNom, int ajoutQte, float prix) {
+        // On met à jour le nom, on AJOUTE à la quantité existante, et on remplace le prix
+        String sql = "UPDATE stock SET nom = ?, quantite_stock = quantite_stock + ?, prix_unitaire = ? WHERE nom = ?";
+        try (java.sql.Connection con = getCon();
+             java.sql.PreparedStatement pst = con.prepareStatement(sql)) {
+            pst.setString(1, nouveauNom);
+            pst.setInt(2, ajoutQte);
+            pst.setFloat(3, prix);
+            pst.setString(4, ancienNom);
+            return pst.executeUpdate() > 0;
+        } catch (Exception e) {
+            e.printStackTrace();
+            return false;
+        }
+        
+    }
+ // --- MÉTHODES MISES À JOUR ET NOUVELLES FONCTIONNALITÉS ---
+
+ // 1. Récupérer le prix (Table: stock, Colonne: prix_unitaire)
+ public static float getPrixProduit(String nom) {
+     try (Connection con = getCon()) {
+         PreparedStatement ps = con.prepareStatement("SELECT prix_unitaire FROM stock WHERE LOWER(nom) = LOWER(?)");
+         ps.setString(1, nom.trim());
+         ResultSet rs = ps.executeQuery();
+         if (rs.next()) return rs.getFloat("prix_unitaire");
+     } catch (Exception e) { e.printStackTrace(); }
+     return 0;
+ }
+
+ // 2. Récupérer le stock
+ public static int getStockProduit(String nom) {
+     try (Connection con = getCon()) {
+         PreparedStatement ps = con.prepareStatement("SELECT quantite_stock FROM stock WHERE LOWER(nom) = LOWER(?)");
+         ps.setString(1, nom.trim());
+         ResultSet rs = ps.executeQuery();
+         if (rs.next()) return rs.getInt("quantite_stock");
+     } catch (Exception e) { e.printStackTrace(); }
+     return 0;
+ }
+
+ // 3. Diminuer le stock
+ public static void diminuerStock(String nom, int qte) {
+     try (Connection con = getCon()) {
+         String sql = "UPDATE stock SET quantite_stock = quantite_stock - ? WHERE LOWER(nom) = LOWER(?)";
+         PreparedStatement ps = con.prepareStatement(sql);
+         ps.setInt(1, qte);
+         ps.setString(2, nom.trim());
+         ps.executeUpdate();
+     } catch (Exception e) { e.printStackTrace(); }
+ }
+
+ // 4. Enregistrer la vente (Structure à 3 colonnes)
+ public static void enregistrerVente(String produit, int qte, int idClient) {
+	    // 1. Correction du nom de la colonne : id_commande_client
+	    String checkSql = "SELECT id_commande_client, quantite_commande FROM commande_client " +
+	                      "WHERE id_client = ? AND LOWER(nom_stock) = LOWER(?)";
+	    
+	    try (Connection con = getCon()) {
+	        PreparedStatement psCheck = con.prepareStatement(checkSql);
+	        psCheck.setInt(1, idClient);
+	        psCheck.setString(2, produit.trim());
+	        ResultSet rs = psCheck.executeQuery();
+
+	        if (rs.next()) {
+	            // 2. Utilisation du bon nom de colonne pour l'ID
+	            int idCmd = rs.getInt("id_commande_client");
+	            String updateSql = "UPDATE commande_client SET quantite_commande = quantite_commande + ? WHERE id_commande_client = ?";
+	            PreparedStatement psUpdate = con.prepareStatement(updateSql);
+	            psUpdate.setInt(1, qte);
+	            psUpdate.setInt(2, idCmd);
+	            psUpdate.executeUpdate();
+	        } else {
+	            // 3. L'insertion reste correcte car les noms de colonnes id_client, nom_stock et quantite_commande sont bons
+	            String insertSql = "INSERT INTO commande_client (id_client, nom_stock, quantite_commande) VALUES (?, ?, ?)";
+	            PreparedStatement psInsert = con.prepareStatement(insertSql);
+	            psInsert.setInt(1, idClient);
+	            psInsert.setString(2, produit.trim());
+	            psInsert.setInt(3, qte);
+	            psInsert.executeUpdate();
+	        }
+	    } catch (Exception e) {
+	        e.printStackTrace();
+	    }
+	}
+
+ // 5. Suggestions sans espaces
+ public static java.util.List<String> getSuggestionsMedicament(String search) {
+     java.util.List<String> list = new java.util.ArrayList<>();
+     try (Connection con = getCon()) {
+         PreparedStatement ps = con.prepareStatement("SELECT DISTINCT TRIM(nom) AS nom_clean FROM stock WHERE nom LIKE ? LIMIT 5");
+         ps.setString(1, search.trim() + "%");
+         ResultSet rs = ps.executeQuery();
+         while (rs.next()) {
+             list.add(rs.getString("nom_clean"));
+         }
+     } catch (Exception e) { e.printStackTrace(); }
+     return list;
+ }
+
+ // 6. Gestion automatique des clients
+ public static int getIdClientByName(String nomClient) {
+     String nomNettoye = nomClient.trim();
+     if(nomNettoye.isEmpty()) nomNettoye = "Passant";
+     
+     try (Connection con = getCon()) {
+         PreparedStatement ps = con.prepareStatement("SELECT id_client FROM client WHERE LOWER(nom) = LOWER(?)");
+         ps.setString(1, nomNettoye);
+         ResultSet rs = ps.executeQuery();
+         if (rs.next()) return rs.getInt("id_client");
+
+         PreparedStatement psInsert = con.prepareStatement("INSERT INTO client (nom) VALUES (?)", Statement.RETURN_GENERATED_KEYS);
+         psInsert.setString(1, nomNettoye);
+         psInsert.executeUpdate();
+         ResultSet rsKeys = psInsert.getGeneratedKeys();
+         if (rsKeys.next()) return rsKeys.getInt(1);
+     } catch (Exception e) { e.printStackTrace(); }
+     return 1;
+ }
+
+ // --- NOUVELLES MÉTHODES POUR L'HISTORIQUE RÉSUMÉ ---
+
+ public static java.util.ArrayList<Object[]> getHistoriqueGroupeParClient() {
+	    java.util.ArrayList<Object[]> data = new java.util.ArrayList<>();
+	    String sql = "SELECT DATE(cc.date_commande) as date_vente, c.nom, SUM(s.prix_unitaire * cc.quantite_commande) as total_paye " +
+	                 "FROM commande_client cc " +
+	                 "JOIN client c ON cc.id_client = c.id_client " +
+	                 "JOIN stock s ON cc.nom_stock = s.nom " +
+	                 "GROUP BY date_vente, c.nom " + 
+	                 "ORDER BY date_vente DESC"; 
+	    
+	    try (Connection con = getCon(); Statement st = con.createStatement(); ResultSet rs = st.executeQuery(sql)) {
+	        while (rs.next()) {
+	            data.add(new Object[]{
+	                rs.getString("date_vente"), 
+	                rs.getString("nom"), 
+	                String.format(java.util.Locale.US, "%.3f", rs.getFloat("total_paye")) + " DT",
+	                "CLIQUEZ POUR DÉTAILS" // <--- IL MANQUAIT CETTE LIGNE
+	            });
+	        }
+	    } catch (Exception e) { e.printStackTrace(); }
+	    return data;
+	}
+
+ /**
+  * Récupère le détail des médicaments achetés par un client spécifique.
+  */
+ public static String getDetailsClient(String nomClient) {
+	    StringBuilder details = new StringBuilder();
+	    String sql = "SELECT nom_stock, quantite_commande FROM commande_client cc " +
+	                 "JOIN client c ON cc.id_client = c.id_client " +
+	                 "WHERE LOWER(c.nom) = LOWER(?)";
+	    try (Connection con = getCon(); PreparedStatement ps = con.prepareStatement(sql)) {
+	        ps.setString(1, nomClient.trim());
+	        ResultSet rs = ps.executeQuery();
+	        while (rs.next()) {
+	            // Formatage propre : PRODUIT ........... QTÉ
+	            String produit = rs.getString("nom_stock");
+	            int qte = rs.getInt("quantite_commande");
+	            details.append(String.format("%-25s x%d\n", produit, qte));
+	            details.append("----------------------------------\n");
+	        }
+	    } catch (Exception e) { e.printStackTrace(); }
+	    return details.toString();
+	}
+//Récupérer toutes les commandes de la base
+//Dans sqlcon.java
+ public static ArrayList<Object[]> getCommandesFournisseurs() {
+	    ArrayList<Object[]> liste = new ArrayList<>();
+	    // Ajout de cf.quantite_f dans la requête
+	    String sql = "SELECT cf.nom_stock, f.nom, cf.quantite_f, cf.fprix_achat_total, cf.etat_commande, cf.id_commande_fournisseur " +
+	                 "FROM commande_fournisseur cf " +
+	                 "JOIN fournisseur f ON cf.id_fournisseur = f.id_fournisseur " +
+	                 "WHERE cf.etat_commande = 'EN ATTENTE'";
+
+	    try (Connection con = getCon(); Statement st = con.createStatement(); ResultSet rs = st.executeQuery(sql)) {
+	        while (rs.next()) {
+	            liste.add(new Object[] {
+	                rs.getString(1), // Médicament
+	                rs.getString(2), // Fournisseur
+	                rs.getInt(3),    // QUANTITÉ (Nouvelle colonne)
+	                rs.getFloat(4),  // Total
+	                rs.getString(5), // Statut
+	                rs.getInt(6)     // ID Caché
+	            });
+	        }
+	    } catch (SQLException e) {
+	        e.printStackTrace();
+	    }
+	    return liste;
+	}
+
+//Ajouter une nouvelle commande
+public static void ajouterCommandeFournisseur(String nomFournisseur, String produit, int qte, float prix) {
+    try (Connection con = getCon()) {
+        con.setAutoCommit(false); // Utilisation d'une transaction pour la sécurité
+        
+        // 1. Chercher l'ID du fournisseur ou le créer
+        int idFourn = -1;
+        String sqlCheckF = "SELECT id_fournisseur FROM fournisseur WHERE nom = ?";
+        PreparedStatement psCheck = con.prepareStatement(sqlCheckF);
+        psCheck.setString(1, nomFournisseur);
+        ResultSet rs = psCheck.executeQuery();
+
+        if (rs.next()) {
+            idFourn = rs.getInt(1);
+        } else {
+            // Le fournisseur n'existe pas, on le crée
+            String sqlInsF = "INSERT INTO fournisseur (nom) VALUES (?)";
+            PreparedStatement psInsF = con.prepareStatement(sqlInsF, Statement.RETURN_GENERATED_KEYS);
+            psInsF.setString(1, nomFournisseur);
+            psInsF.executeUpdate();
+            ResultSet rsKeys = psInsF.getGeneratedKeys();
+            if (rsKeys.next()) idFourn = rsKeys.getInt(1);
+        }
+
+        // 2. Insérer la commande avec l'ID récupéré
+        String sqlCmd = "INSERT INTO commande_fournisseur (id_fournisseur, nom_stock, quantite_f, fprix_achat_total, etat_commande) " +
+                        "VALUES (?, ?, ?, ?, 'EN ATTENTE')";
+        PreparedStatement psCmd = con.prepareStatement(sqlCmd);
+        psCmd.setInt(1, idFourn);
+        psCmd.setString(2, produit);
+        psCmd.setInt(3, qte);
+        psCmd.setFloat(4, prix);
+        psCmd.executeUpdate();
+
+        con.commit();
+    } catch (SQLException e) {
+        e.printStackTrace();
+    }
+}
+
+//Mettre à jour le statut (REÇUE ou ANNULÉE)
+public static void updateStatutCommande(int id, String nouveauStatut) {
+  String sql = "UPDATE commande_fournisseur SET etat_commande = ? WHERE id_commande_fournisseur = ?";
+  try (Connection con = getCon(); PreparedStatement ps = con.prepareStatement(sql)) {
+      ps.setString(1, nouveauStatut);
+      ps.setInt(2, id);
+      ps.executeUpdate();
+  } catch (Exception e) { e.printStackTrace(); }
+}
+public static void marquerCommandeRecue(int idCommande) {
+    // On utilise les noms exacts de ta table : quantite_f et fprix_achat_total
+    String sqlGetInfos = "SELECT nom_stock, quantite_f, fprix_achat_total FROM commande_fournisseur WHERE id_commande_fournisseur = ?";
+    
+    try (Connection con = getCon()) {
+        con.setAutoCommit(false); 
+
+        try (PreparedStatement psInfo = con.prepareStatement(sqlGetInfos)) {
+            psInfo.setInt(1, idCommande);
+            ResultSet rs = psInfo.executeQuery();
+            
+            if (rs.next()) {
+                String nomProd = rs.getString("nom_stock");
+                int qteAchetee = rs.getInt("quantite_f");
+                float prixTotal = rs.getFloat("fprix_achat_total");
+                // Calcul du prix unitaire pour le stock
+                float prixUnitaireCalculé = (qteAchetee > 0) ? (prixTotal / qteAchetee) : 0;
+
+                // 1. Vérifier si le produit existe déjà dans 'stock'
+                String sqlCheck = "SELECT COUNT(*) FROM stock WHERE nom = ?";
+                PreparedStatement psCheck = con.prepareStatement(sqlCheck);
+                psCheck.setString(1, nomProd);
+                ResultSet rsCheck = psCheck.executeQuery();
+                rsCheck.next();
+                
+                if (rsCheck.getInt(1) > 0) {
+                    // UPDATE : noms de colonnes : quantite_stock et prix_unitaire
+                    String sqlUpdateStock = "UPDATE stock SET quantite_stock = quantite_stock + ?, prix_unitaire = ? WHERE nom = ?";
+                    PreparedStatement psUp = con.prepareStatement(sqlUpdateStock);
+                    psUp.setInt(1, qteAchetee);
+                    psUp.setFloat(2, prixUnitaireCalculé);
+                    psUp.setString(3, nomProd);
+                    psUp.executeUpdate();
+                } else {
+                    // INSERT : Nouveau produit (si non existant)
+                    String sqlInsert = "INSERT INTO stock (nom, quantite_stock, prix_unitaire) VALUES (?, ?, ?)";
+                    PreparedStatement psIns = con.prepareStatement(sqlInsert);
+                    psIns.setString(1, nomProd);
+                    psIns.setInt(2, qteAchetee);
+                    psIns.setFloat(3, prixUnitaireCalculé);
+                    psIns.executeUpdate();
+                }
+
+                // 2. Mettre à jour le statut de la commande
+                String sqlFinal = "UPDATE commande_fournisseur SET etat_commande = 'REÇUE' WHERE id_commande_fournisseur = ?";
+                PreparedStatement psFinal = con.prepareStatement(sqlFinal);
+                psFinal.setInt(1, idCommande);
+                psFinal.executeUpdate();
+
+                con.commit();
+                System.out.println("✅ Commande traitée : " + nomProd + " ajouté au stock.");
+            }
+        } catch (SQLException e) {
+            con.rollback();
+            System.err.println("❌ Erreur SQL : " + e.getMessage());
+        }
+    } catch (SQLException e) {
+        e.printStackTrace();
+    }
+}
+public static int getNbCommandesJour() {
+    // On compte uniquement les commandes où la date est égale à aujourd'hui
+    String sql = "SELECT COUNT(*) FROM commande_client WHERE DATE(date_commande) = CURDATE()";
+    try (Connection con = getCon(); Statement st = con.createStatement(); ResultSet rs = st.executeQuery(sql)) {
+        if (rs.next()) return rs.getInt(1);
+    } catch (SQLException e) {
+        e.printStackTrace();
+    }
+    return 0;
+}
+}
