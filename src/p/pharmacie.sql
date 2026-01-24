@@ -1,7 +1,6 @@
 CREATE DATABASE pharmacie_db;
 USE pharmacie_db;
 
--- 2. Table Utilisateur
 CREATE TABLE utilisateur (
     cle INT PRIMARY KEY AUTO_INCREMENT,
     user VARCHAR(50) NOT NULL UNIQUE, 
@@ -9,26 +8,22 @@ CREATE TABLE utilisateur (
     type VARCHAR(20) NOT NULL
 );
 
--- 3. Table Stock
 CREATE TABLE stock (
     nom VARCHAR(50) PRIMARY KEY,
     prix_unitaire FLOAT NOT NULL,    
     quantite_stock INT NOT NULL      
 );
 
--- 4. Table Client
 CREATE TABLE client (
     id_client INT AUTO_INCREMENT PRIMARY KEY,
     nom VARCHAR(50) NOT NULL
 );
 
--- 5. Table Fournisseur
 CREATE TABLE fournisseur (
     id_fournisseur INT AUTO_INCREMENT PRIMARY KEY,
     nom VARCHAR(50) NOT NULL
 );
 
--- 6. Table Commande Client (On garde la FK car on ne vend que ce qu'on a en stock)
 CREATE TABLE commande_client (
     id_commande_client INT AUTO_INCREMENT PRIMARY KEY,
     id_client INT NOT NULL,
@@ -39,7 +34,6 @@ CREATE TABLE commande_client (
     FOREIGN KEY (nom_stock) REFERENCES stock(nom)
 );
 
--- 7. Table Commande Fournisseur (CORRIGÉE : Pas de FK sur le stock ici)
 CREATE TABLE commande_fournisseur (
     id_commande_fournisseur INT AUTO_INCREMENT PRIMARY KEY,
     id_fournisseur INT NOT NULL,
