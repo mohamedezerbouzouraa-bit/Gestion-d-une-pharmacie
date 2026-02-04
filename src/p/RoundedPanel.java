@@ -11,8 +11,7 @@ public class RoundedPanel extends JPanel {
         super();
         this.radius = radius;
         this.backgroundColor = bgColor;
-        setOpaque(false); // Permet de voir le fond de la fenêtre derrière les coins arrondis
-    }
+        setOpaque(false); // Permet de voir le fond de la fenêtre derrière les coins arrondis}
 
     @Override
     protected void paintComponent(Graphics g) {
