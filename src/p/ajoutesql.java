@@ -10,7 +10,6 @@ import java.sql.DriverManager;
 import connection.sqlcon; 
 
 public class ajoutesql extends JFrame {
-
     private static final long serialVersionUID = 1L;
     private JPanel contentPane;
     private JPasswordField passwordField; 
